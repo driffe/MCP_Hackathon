@@ -1,238 +1,182 @@
 from flask import Flask, request, jsonify
-from input_schema import (
-    UserProfile, EmotionData, RoutineData, AlertData,
-    VAPIConfig, RoutineConfig, AlertConfig
-)
 import requests
 import os
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime
 from dotenv import load_dotenv
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# 로깅 설정
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 VAPI_API_KEY = os.getenv("VAPI_API_KEY")
-DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-class SafeSpeakSystem:
-    def __init__(self):
-        """
-        Initialize SafeSpeak system components
-        """
-        self.vapi_url = "https://api.vapi.ai/v1"
-        self.deepl_url = "https://api-free.deepl.com/v2/translate"
-        self.headers = {
+app = Flask(__name__)
+
+def analyze_emotion(audio_data: str) -> dict:
+    """
+    Analyze emotion from audio data using VAPI
+    
+    Args:
+        audio_data: Base64 encoded audio data
+        
+    Returns:
+        dict: Analysis results
+    """
+    try:
+        # VAPI API 요청 구성
+        headers = {
             "Authorization": f"Bearer {VAPI_API_KEY}",
             "Content-Type": "application/json"
         }
-        self.users = {}  # In-memory user storage (replace with database in production)
-
-    def register_user(self, profile: UserProfile) -> dict:
-        """
-        Register a new user profile
         
-        Args:
-            profile: UserProfile object containing user information
-            
-        Returns:
-            dict: Registration status
-        """
-        self.users[profile.user_id] = profile
-        return {"status": "success", "user_id": profile.user_id}
-
-    def analyze_emotion(self, user_id: str, audio_data: str) -> EmotionData:
-        """
-        Analyze user's emotional state using VAPI
-        
-        Args:
-            user_id: User identifier
-            audio_data: Base64 encoded audio data
-            
-        Returns:
-            EmotionData: Analysis results
-        """
-        user = self.users.get(user_id)
-        if not user:
-            raise ValueError("User not found")
-
-        # Call VAPI for emotion analysis
+        # VAPI Call Analysis API
         payload = {
-            "audio": audio_data,
-            "config": user.vapi_config.dict(),
-            "language": user.vapi_config.language
+            "audioData": audio_data,
+            "config": {
+                "language": "ko",
+                "model": "emotion-detection",
+                "sensitivity": 0.8,
+                "analysisPlan": {
+                    "summaryPrompt": "You are an expert emotion analyzer. Summarize the emotional state of the speaker in 2-3 sentences.",
+                    "structuredDataPrompt": "Extract emotional data from the call transcript.",
+                    "structuredDataSchema": {
+                        "type": "object",
+                        "properties": {
+                            "emotion": { "type": "string" },
+                            "intensity": { "type": "number" },
+                            "confidence": { "type": "number" }
+                        },
+                        "required": ["emotion", "intensity", "confidence"]
+                    },
+                    "successEvaluationPrompt": "Evaluate the emotional state of the speaker on a scale of 1-10, where 1 is extremely negative and 10 is extremely positive.",
+                    "successEvaluationRubric": "NumericScale"
+                }
+            }
         }
         
+        # VAPI API call
         response = requests.post(
-            f"{self.vapi_url}/analyze",
-            headers=self.headers,
-            json=payload
+            "https://api.vapi.ai/analyze/emotion",
+            headers=headers,
+            json=payload,
+            timeout=30
         )
         
+        # response validation
         if response.status_code != 200:
+            logger.error(f"VAPI API error: {response.status_code} - {response.text}")
             raise Exception(f"VAPI analysis failed: {response.text}")
-            
+        
+        # response processing
         result = response.json()
+        analysis = result.get("analysis", {})
         
-        return EmotionData(
-            timestamp=datetime.now(),
-            emotion=result["emotion"],
-            severity=result["severity"],
-            confidence=result["confidence"],
-            transcript=result.get("transcript")
-        )
-
-    def check_routine(self, user_id: str) -> RoutineData:
-        """
-        Check user's routine patterns
+        # extract emotion data
+        emotion = analysis.get("structuredData", {}).get("emotion", "neutral")
+        intensity = analysis.get("structuredData", {}).get("intensity", 0.5)
+        confidence = analysis.get("structuredData", {}).get("confidence", 0.0)
+        transcript = result.get("transcript", "")
         
-        Args:
-            user_id: User identifier
-            
-        Returns:
-            RoutineData: Routine status
-        """
-        user = self.users.get(user_id)
-        if not user:
-            raise ValueError("User not found")
-
-        now = datetime.now()
-        last_interaction = self.get_last_interaction(user_id)
-        silence_duration = (now - last_interaction).total_seconds() / 3600  # hours
+        # convert NumericScale to severity (1-10 scale)
+        severity = analysis.get("successEvaluation", {}).get("score", 5)
         
-        # Check medication status
-        medication_status = self.check_medication_status(user)
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "emotion": emotion,
+            "severity": severity,
+            "confidence": confidence,
+            "transcript": transcript
+        }
         
-        return RoutineData(
-            timestamp=now,
-            last_interaction=last_interaction,
-            medication_status=medication_status,
-            activity_level=self.calculate_activity_level(user_id),
-            silence_duration=silence_duration
-        )
-
-    def send_alert(self, alert_data: AlertData) -> dict:
-        """
-        Send emergency alert with translation
-        
-        Args:
-            alert_data: AlertData object containing alert information
-            
-        Returns:
-            dict: Alert status
-        """
-        # Translate message if needed
-        translated_messages = {}
-        for recipient in alert_data.recipients:
-            user = self.get_user_by_contact(recipient)
-            if user and user.alert_config.preferred_language != "ko":
-                translated = self.translate_message(
-                    alert_data.message,
-                    user.alert_config.preferred_language
-                )
-                translated_messages[recipient] = translated
-            else:
-                translated_messages[recipient] = alert_data.message
-
-        # Send alerts to all recipients
-        results = {}
-        for recipient, message in translated_messages.items():
-            # Implement actual alert sending (SMS, email, etc.)
-            results[recipient] = {
-                "status": "sent",
-                "message": message,
-                "timestamp": datetime.now().isoformat()
-            }
-
-        return results
-
-    def translate_message(self, message: str, target_lang: str) -> str:
-        """
-        Translate message using DeepL
-        
-        Args:
-            message: Text to translate
-            target_lang: Target language code
-            
-        Returns:
-            str: Translated message
-        """
-        response = requests.post(
-            self.deepl_url,
-            data={
-                "auth_key": DEEPL_API_KEY,
-                "text": message,
-                "target_lang": target_lang
-            }
-        )
-        return response.json()["translations"][0]["text"]
-
-    # Helper methods
-    def get_last_interaction(self, user_id: str) -> datetime:
-        """Get timestamp of last user interaction"""
-        # Implement actual last interaction tracking
-        return datetime.now() - timedelta(hours=1)
-
-    def check_medication_status(self, user: UserProfile) -> List[dict]:
-        """Check medication schedule status"""
-        # Implement actual medication tracking
-        return []
-
-    def calculate_activity_level(self, user_id: str) -> float:
-        """Calculate user's activity level"""
-        # Implement actual activity level calculation
-        return 0.8
-
-    def get_user_by_contact(self, contact: str) -> Optional[UserProfile]:
-        """Find user profile by contact information"""
-        for user in self.users.values():
-            if (user.alert_config.primary_contact == contact or 
-                user.alert_config.secondary_contact == contact):
-                return user
-        return None
-
-# Initialize Flask app and system
-app = Flask(__name__)
-system = SafeSpeakSystem()
-
-@app.route('/register', methods=['POST'])
-def register():
-    """Register new user"""
-    try:
-        profile = UserProfile(**request.json)
-        result = system.register_user(profile)
-        return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Emotion analysis error: {str(e)}")
+        raise
 
-@app.route('/analyze_emotion/<user_id>', methods=['POST'])
-def analyze_emotion(user_id):
-    """Analyze user's emotional state"""
+def send_email_notification(analysis_result: dict, recipient_email: str):
+    """
+    Send email notification with analysis results
+    
+    Args:
+        analysis_result: Emotion analysis results
+        recipient_email: Email address to send notification
+    """
     try:
-        audio_data = request.json.get('audio_data')
-        if not audio_data:
-            return jsonify({"error": "No audio data provided"}), 400
+        # Email configuration
+        sender_email = "safespeak@example.com"
+        subject = "Emotion analysis result notification"
+        
+        # Create email content
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = recipient_email
+        message["Subject"] = subject
+        
+        # Email body
+        body = f"""
+        Emotion analysis result:
+        
+        Time: {analysis_result['timestamp']}
+        Emotion: {analysis_result['emotion']}
+        Severity: {analysis_result['severity']}/10
+        Confidence: {analysis_result['confidence']}
+        
+        Transcript:
+        {analysis_result['transcript']}
+        """
+        
+        message.attach(MIMEText(body, "plain"))
+        
+        # Send email
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(sender_email, EMAIL_PASSWORD)
+            server.send_message(message)
             
-        result = system.analyze_emotion(user_id, audio_data)
-        return jsonify(result.dict())
+        logger.info(f"Email notification sent to {recipient_email}")
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Email sending error: {str(e)}")
+        raise
 
-@app.route('/check_routine/<user_id>', methods=['GET'])
-def check_routine(user_id):
-    """Check user's routine"""
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    """
+    Analyze emotion and send email notification
+    """
     try:
-        result = system.check_routine(user_id)
-        return jsonify(result.dict())
+        data = request.json
+        audio_data = data.get('audio_data')
+        recipient_email = data.get('recipient_email')
+        
+        if not audio_data or not recipient_email:
+            return jsonify({
+                "status": "error",
+                "message": "audio_data and recipient_email are required"
+            }), 400
+        
+        # Analyze emotion
+        analysis_result = analyze_emotion(audio_data)
+        
+        # Send email notification
+        send_email_notification(analysis_result, recipient_email)
+        
+        return jsonify({
+            "status": "success",
+            "data": analysis_result
+        })
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route('/send_alert', methods=['POST'])
-def send_alert():
-    """Send emergency alert"""
-    try:
-        alert_data = AlertData(**request.json)
-        result = system.send_alert(alert_data)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        logger.error(f"Analysis error: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 if __name__ == '__main__':
-    app.run(debug=True) 
+    app.run(debug=True, host='0.0.0.0', port=5000) 
