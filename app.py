@@ -8,7 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# 로깅 설정
+# logging configuration
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ def analyze_emotion(audio_data: str) -> dict:
         dict: Analysis results
     """
     try:
-        # VAPI API 요청 구성
+        # VAPI API request configuration
         headers = {
             "Authorization": f"Bearer {VAPI_API_KEY}",
             "Content-Type": "application/json"
@@ -39,7 +39,7 @@ def analyze_emotion(audio_data: str) -> dict:
         payload = {
             "audioData": audio_data,
             "config": {
-                "language": "ko",
+                "language": "en",
                 "model": "emotion-detection",
                 "sensitivity": 0.8,
                 "analysisPlan": {
