@@ -1,10 +1,10 @@
-import logo from './logo.svg';
-import './App.css';
+import './SafeSpeakDashboard';
+import SafeSpeakDashboard from './SafeSpeakDashboard';
 
 function App() {
   return (
     <div className="App">
-     "This is my frontend"
+      <SafeSpeakDashboard />
     </div>
   );
 }
